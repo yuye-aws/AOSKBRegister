@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template to deploy a knowledge base agent in Amazon OpenSearch Service
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Amazon OpenSearch Configuration"
+        Parameters:
+          - AmazonOpenSearchRegion
+          - AmazonOpenSearchDomainName
+      -
+        Label:
+          default: "Knowledge Base Configuration"
+        Parameters:
+          - KnowledgeBaseRegion
+          - KnowledgeBaseId
+          - LlmArn
+    ParameterLabels:
+      AmazonOpenSearchRegion:
+        default: "Amazon OpenSearch Region"
+      AmazonOpenSearchDomainEndpoint:
+        default: "Amazon OpenSearch Domain Endpoint"
+      KnowledgeBaseRegion:
+        default: "Knowledge Base Region"
+      KnowledgeBaseId:
+        default: "Knowledge Base Id"
+      LlmArn:
+        default: "LLM ARN"
+      LambdaInvokeOpenSearchMLCommonsRoleName:
+        default: "Lambda Invoke OpenSearch ML Commons Role Name"
+
+Parameters:
+  AmazonOpenSearchRegion:
+    Type: String
+    Description: "The region of the Amazon OpenSearch Service. Example: us-west-2"
+    Default: "us-west-2"
+  AmazonOpenSearchDomainEndpoint:
+    Type: String
+    Description: The endpoint of the Amazon OpenSearch Service.
+    Default: "https://search-amazon-pqa-2ranuqye5clekosvrrgi6dao6i.us-west-2.es.amazonaws.com"
+  KnowledgeBaseRegion:
+    Type: String
+    Description: "The region of the Knowledge Base. Example: us-west-2"
+    Default: "us-west-2"
+  KnowledgeBaseId:
+    Type: String
+    Description: "The Id of the Knowledge Base."
+    Default: "CYYDYBFKGV"
+  LlmArn:
+    Description: "The ARN of the LLM used for Knowledge Base RAG service"
+    Type: String
+    Default: "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+  LambdaInvokeOpenSearchMLCommonsRoleName:
+    Type: String
+    Default: "LambdaInvokeOpenSearchMLCommonsRole"
+    ConstraintDescription: Must use alphanumeric and '+=,.@-_' characters.
+    Description: The name of the IAM role that is used by Lambda to invoke Amazon OpenSearch domain. Before deploying this template, it must be mapped to the OpenSearch domain's ml_full_access role . The IAM role will be created by this template if it does not exist. You can use the default value or specify a custom name. If you specify a custom name, it must be unique within your account.
+    AllowedPattern: "[a-zA-Z0-9+=,.@_-]+"
+
+Resources:
+  HelperLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ '-', [ "HelperLambdaInvokeRole", !Ref KnowledgeBaseId ] ]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - iam:ListRoles
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:GetRolePolicy
+                  - iam:CreatePolicy
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:DeleteBucket
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - es:DescribeElasticsearchDomain
+                Resource: "*"
+
+  HelperLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [ HelperLambdaInvokeRole ]
+    Properties:
+      FunctionName: !Join [ '-', [ "HelperLambdaFunction", !Ref KnowledgeBaseId ] ]
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import urllib.request
+          import json
+          import botocore
+          import time
+
+          def lambda_handler(event, context):
+              print("event: " + str(event))
+              response_data = {'ContinuedInvoke': True}
+              try:
+                  url = event['ResourceProperties']['LambdaZipUrl']
+                  s3_key = event['ResourceProperties']['S3Key']
+                  tmp_file_path = f"/tmp/{s3_key}"
+
+                  download_file(url, tmp_file_path)
+                  bucket_name = event['ResourceProperties']['S3Bucket']
+                  create_s3_bucket(bucket_name)
+                  upload_file_to_s3(bucket_name, s3_key, tmp_file_path)
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, context.log_stream_name)
+                  return {"statusCode": 200}
+              except Exception as e:
+                  print(e)
+                  response_data['ContinuedInvoke'] = False
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, context.log_stream_name)
+                  return {"statusCode": 500}
+
+          def download_file(url, file_path):
+              urllib.request.urlretrieve(url, file_path)
+              print(f"Downloaded file from {url} to {file_path}")
+
+          def create_s3_bucket(bucket_name):
+              s3 = boto3.client('s3')
+              region = boto3.session.Session().region_name
+              if region == 'us-east-1':
+                  s3.create_bucket(Bucket=bucket_name)
+              else:
+                  s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': region})
+              print(f"S3 bucket {bucket_name} created successfully")
+
+          def upload_file_to_s3(bucket_name, s3_key, file_path):
+              s3 = boto3.resource('s3')
+              s3.Bucket(bucket_name).upload_file(file_path, s3_key)
+              print(f"Uploaded file to s3://{bucket_name}/{s3_key}")
+
+          def respond_success(event, context):
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, context.log_stream_name)
+              return {"statusCode": 200}
+
+      Handler: index.lambda_handler
+      Role: !GetAtt HelperLambdaInvokeRole.Arn
+      Runtime: python3.8
+      Timeout: 120
+
+  HelperLambdaInvoke:
+    Type: Custom::InvokeLambda
+    DependsOn: [HelperLambdaFunction]
+    Properties:
+      ServiceToken: !GetAtt HelperLambdaFunction.Arn
+      LambdaZipUrl: "https://raw.githubusercontent.com/yuye-aws/AOSKBRegister/main/opensearch-knowledge-base-create-agent.zip"
+      S3Bucket: !Join ['-', ["opensearch-knowledge-base-lambda-function", "stack", !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      S3Key: opensearch-knowledge-base-create-agent.zip
+  
+  AgentLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [HelperLambdaInvoke]
+    Properties:
+      FunctionName: !Join [ "-", [ "Lambda", "kb", "agent", !Ref KnowledgeBaseId] ]
+      Code:
+        S3Bucket: !Join ['-', ["opensearch-knowledge-base-lambda-function", "stack", !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+        S3Key: opensearch-knowledge-base-create-agent.zip
+      PackageType: Zip
+      Handler: lambda_function.lambda_handler
+      Role:
+          Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaInvokeOpenSearchMLCommonsRoleName}
+      Runtime: python3.8
+      Timeout: 120
+
+  InvokeAgentLambda:
+    Type: Custom::InvokeLambda
+    DependsOn: [AgentLambdaFunction]
+    Properties:
+      ServiceToken: !GetAtt AgentLambdaFunction.Arn
+      AmazonOpenSearchRegion: !Ref AmazonOpenSearchRegion
+      AmazonOpenSearchDomainEndpoint: !Ref AmazonOpenSearchDomainEndpoint
+      KnowledgeBaseRegion: !Ref KnowledgeBaseRegion
+      KnowledgeBaseId: !Ref KnowledgeBaseId
+      LlmArn: !Ref LlmArn
+      LambdaInvokeOpenSearchMLCommonsRoleName: !Ref LambdaInvokeOpenSearchMLCommonsRoleName
+
+Outputs:
+  ConnectorId:
+    Value: !GetAtt InvokeAgentLambda.connector_id
+    Description: The connector id that is created in Amazon OpenSearch Service ML-Commons.
+  ModelId:
+    Value: !GetAtt InvokeAgentLambda.model_id
+    Description: The model id in ML-Commons that is associatd with the connector id.
+  AgentId:
+      Value: !GetAtt InvokeAgentLambda.agent_id
+      Description: The agent id in ML-Commons that is associatd with the model id.
+
